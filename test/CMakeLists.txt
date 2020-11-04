@@ -1,5 +1,9 @@
 include(dtest)
 
+# -------------------------------- Atomics ------------------------------------
+
+add_dtests(NAME test_atomic_drc_ptr FILES test_atomic_drc_ptr.cpp LIBS parlay)
+
 # ------------------------------ Range and Slice -------------------------------
 
 add_dtests(NAME test_range FILES test_range.cpp LIBS parlay)
