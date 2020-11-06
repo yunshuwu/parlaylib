@@ -50,7 +50,7 @@ class rc_ptr {
     auto tmp = ptr;
     ptr = other.ptr;
     if (ptr) increment_counter(ptr);
-    if (tmp) decrement_ctr(tmp);
+    if (tmp) decrement_counter(tmp);
     return *this;
   }
 
@@ -76,6 +76,10 @@ class rc_ptr {
   bool operator!=(const rc_ptr& other) const { return get() != other.get(); }
 
   size_t use_count() const noexcept { return (ptr == nullptr) ? 0 : ptr->ref_cnt.load(); }
+
+  void swap(rc_ptr& other) {
+    std::swap(ptr, other.ptr);
+  }
 
   // Create a new rc_ptr containing an object of type T constructed from (args...).
   template<typename... Args>

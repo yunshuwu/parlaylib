@@ -8,23 +8,27 @@
 #include <atomic>
 #include <vector>
 
+#include "snapshot_ptr.h"
+
 #include "../parallel.h"
 
 namespace parlay {
 namespace internal {
-
-// An array that begins at 64-byte-aligned memory
-template<typename _Tp, size_t sz>
-struct alignas(64) AlignedArray : public std::array<_Tp, sz> {
-  size_t size{0};
-  void push_back(_Tp&& p) { (*this)[size++] = std::move(p); }
-};
 
 // A vector that is stored at 64-byte-aligned memory (this
 // means that the header of the vector, not the heap buffer,
 // is aligned to 64 bytes)
 template<typename _Tp>
 struct alignas(64) AlignedVector : public std::vector<_Tp> {};
+
+// A cache-line-aligned bool to prevent false sharing
+struct alignas(64) AlignedBool {
+  AlignedBool() : b(false) { }
+  /* implicit */ AlignedBool(bool b_) : b(b_) { }
+  operator bool() const { return b; }
+ private:
+  bool b;
+};
 
 // A chaining hashtable optimized for storing a small number of entries.
 // Allows duplicate entries. B is the number of top-level buckets
@@ -86,22 +90,28 @@ struct tiny_table {
   }
 };
 
-// An interface for safe memory reclamation that protects atomic access to resources
-// by deferring their destruction until no thread is still reading them.
+// An interface for safe memory reclamation that protects reference-counted
+// resources by deferring their reference count decrements until no thread
+// is still reading them.
 //
-// Unlike hazard pointers, acquire-retire allows multiple concurrent retires of
-// the same handle, which makes it suitable for managing reference counted pointers,
-// since multiple copies of the same reference counted pointer may need to be
-// destructed (i.e., have their counter decremented) concurrently.
+// Unlike hazard pointers, acquire-retire allows multiple concurrent retires
+// of the same handle, which is what makes it suitable for managing reference
+// counted pointers, since multiple copies of the same reference counted pointer
+// may need to be destructed (i.e., have their counter decremented) concurrently.
 //
-// T =        The type of the handle being protected. Must be trivially copyable.
-// Deleter =  A stateless functor whose call operator takes a handle to a free'd
-//            resource and performs the corresponding deferred destruction
-// Empty =    A sentinel value that corresponds to an empty value of type T
+// T =          The type of the handle being protected. Must be trivially copyable
+//              and pointer-like.
+// Deleter =    A stateless functor whose call operator takes a handle to a free'd
+//              pointer and performs the corresponding deferred decrement
+// Incrementer = A stateless functor whose call operator takes a handle to a snapshotted
+//               object and increments its reference count
 // delay =    The maximum number of deferred destructions that will be held by
 //            any one worker thread is at most delay * #threads.
+// snapshot_slots = The number of additional announcement slots available for
+//                  snapshot pointers. More allows more snapshots to be alive
+//                  at a time, but makes reclamation slower
 //
-template<typename T, typename Deleter, T Empty = T{}, size_t delay = 5>
+template<typename T, typename Deleter, typename Incrementer, size_t delay = 5, size_t snapshot_slots = 3>
 struct acquire_retire {
 
   static_assert(std::is_trivially_copyable_v<T>, "T must be a trivially copyable type for acquire-retire");
@@ -110,25 +120,39 @@ struct acquire_retire {
   // Align to cache line boundary to avoid false sharing
   struct alignas(64) LocalSlot {
     std::atomic<T> announcement;
-    LocalSlot() : announcement(Empty) { }
+    size_t last_free{0};
+    std::array<std::atomic<T>, snapshot_slots> snapshot_announcements{};
+    LocalSlot() : announcement(nullptr) {
+      for (auto& a : snapshot_announcements) {
+        std::atomic_init(&a, nullptr);
+      }
+    }
   };
 
  public:
-
   // An RAII wrapper around an acquired handle. Automatically
   // releases the handle when the wrapper goes out of scope.
   struct acquired {
    public:
     T value;
-    acquired& operator=(acquired&& other) { value = other.value; other.value = Empty; }
-    ~acquired() { if (value != Empty) { slot.store(Empty, std::memory_order_release); } }
+    acquired& operator=(acquired&& other) {
+      value = other.value;
+      other.value = nullptr;
+    }
+    ~acquired() {
+      if (value != nullptr) {
+        slot.store(nullptr, std::memory_order_release);
+      }
+    }
+
    private:
     friend struct acquire_retire;
     std::atomic<T>& slot;
-    acquired(T value_, std::atomic<T>& slot_) : value(value_), slot(slot_) { }
+    acquired(T value_, std::atomic<T>& slot_) : value(value_), slot(slot_) {}
   };
 
-  acquire_retire(size_t num_threads) : announcement_slots(num_threads), deferred_destructs(num_threads) { }
+  acquire_retire(size_t num_threads) :
+      announcement_slots(num_threads), in_progress(num_threads), deferred_destructs(num_threads) {}
 
   [[nodiscard]] acquired acquire(const std::atomic<T>* p) {
     auto id = worker_id();
@@ -148,10 +172,20 @@ struct acquire_retire {
     return {p, announcement_slots[id].announcement};
   }
 
+  [[nodiscard]] std::pair<T, std::atomic<T>*> protect_snapshot(const std::atomic<T>* p) {
+    auto* slot = get_free_slot();
+    T result;
+    do {
+      result = p->load(std::memory_order_seq_cst);
+      slot->store(result, std::memory_order_seq_cst);
+    } while (p->load(std::memory_order_seq_cst) != result);
+    return std::make_pair(result, slot);
+  }
+
   void release() {
     auto id = worker_id();
     auto& slot = announcement_slots[id].announcement;
-    slot.store(Empty, std::memory_order_release);
+    slot.store(nullptr, std::memory_order_release);
   }
 
   void retire(T p) {
@@ -160,47 +194,100 @@ struct acquire_retire {
     perform_deferred_decrements();
   }
 
+  // Perform any remaining deferred destruction. Need to be very careful
+  // about additional objects being queued for deferred destruction by
+  // an object that was just destructed.
   ~acquire_retire() {
-    for (const auto& dds : deferred_destructs) {
-      for (auto x : dds) {
-        Deleter()(x);
+    in_progress.assign(in_progress.size(), true);
+
+    // Loop because the destruction of one object could trigger the deferred
+    // destruction of another object (possibly even in another thread), and
+    // so on recursively.
+    while (std::any_of(deferred_destructs.begin(), deferred_destructs.end(),
+                       [](const auto& v) { return !v.empty(); })) {
+
+      // Move all of the contents from the deferred destruction lists
+      // into a single local list. We don't want to just iterate the
+      // deferred lists because a destruction may trigger another
+      // deferred destruction to be added to one of the lists, which
+      // would invalidate its iterators
+      std::vector<T> destructs;
+      for (auto& v : deferred_destructs) {
+        destructs.insert(destructs.end(), v.begin(), v.end());
+        v.clear();
+      }
+
+      // Perform all of the pending deferred destructions
+      for (auto x : destructs) {
+        Deleter{}(x);
       }
     }
   }
 
  private:
+  // Apply the function f to every currently announced handle
+  template<typename F>
+  void scan_slots(F&& f) {
+    for (const auto& announcement_slot : announcement_slots) {
+      auto x = announcement_slot.announcement.load(std::memory_order_seq_cst);
+      if (x != nullptr) f(x);
+      for (const auto& free_slot : announcement_slot.snapshot_announcements) {
+        auto y = free_slot.load(std::memory_order_seq_cst);
+        if (y != nullptr) f(y);
+      }
+    }
+  }
+
+  [[nodiscard]] std::atomic<T>* get_free_slot() {
+    auto id = worker_id();
+    for (size_t i = 0; i < snapshot_slots; i++) {
+      if (announcement_slots[id].snapshot_announcements[i].load(std::memory_order_seq_cst) == nullptr) {
+        return std::addressof(announcement_slots[id].snapshot_announcements[i]);
+      }
+    }
+    auto& last_free = announcement_slots[id].last_free;
+    auto kick_ptr = announcement_slots[id].snapshot_announcements[last_free].load(std::memory_order_seq_cst);
+    assert(kick_ptr != nullptr);
+    Incrementer{}(kick_ptr);
+    std::atomic<T>* return_slot = std::addressof(announcement_slots[id].snapshot_announcements[last_free]);
+    last_free = (last_free + 1 == snapshot_slots) ? 0 : last_free + 1;
+    return return_slot;
+  }
 
   void perform_deferred_decrements() {
     auto id = worker_id();
-    if (deferred_destructs[id].size() == announcement_slots.size() * delay) {
-      tiny_table<T, 512> announced(announcement_slots.size());
-      for (const auto& announcement_slot : announcement_slots) {
-        auto& slot = announcement_slot.announcement;
-        auto reserved = slot.load(std::memory_order_seq_cst);
-        if (reserved != Empty) {
-          announced.insert(reserved);
-        }
-      }
+    while (!in_progress[id] && deferred_destructs[id].size() >= announcement_slots.size() * delay) {
+      in_progress[id] = true;
+      auto deferred = AlignedVector<T>(std::move(deferred_destructs[id]));
+      tiny_table<T, 1024> announced(announcement_slots.size() * (1 + snapshot_slots));
+      scan_slots([&](auto reserved) { announced.insert(reserved); });
+
+      // For a given deferred decrement, we first check if it is announced, and, if so,
+      // we defer it again. If it is not announced, it can be safely applied. If an
+      // object is deferred / announced multiple times, each announcement only protects
+      // against one of the deferred decrements, so for each object, the amount of
+      // decrements applied in total will be #deferred - #announced
       auto f = [&](auto x) {
         auto it = announced.find(x);
         if (it == nullptr) {
-          Deleter()(x);
+          Deleter{}(x);
           return true;
         } else {
-          *it = Empty;
+          *it = nullptr;
           return false;
         }
       };
 
-      // Remove the deferred decrements that were successfully applied
-      deferred_destructs[id].erase(
-          deferred_destructs[id].begin(),
-          remove_if(deferred_destructs[id].begin(), deferred_destructs[id].end(), f));
+      // Remove the deferred decrements that are successfully applied
+      deferred.erase(remove_if(deferred.begin(), deferred.end(), f), deferred.end());
+      deferred_destructs[id].insert(deferred_destructs[id].end(), deferred.begin(), deferred.end());
+      in_progress[id] = false;
     }
   }
 
-  std::vector<LocalSlot> announcement_slots;
-  std::vector<AlignedVector<T>> deferred_destructs;
+  std::vector<LocalSlot> announcement_slots;          // Announcement array slots
+  std::vector<AlignedBool> in_progress;               // Local flags to prevent reentrancy while destructing
+  std::vector<AlignedVector<T>> deferred_destructs;   // Thread-local lists of pending deferred destructs
 };
 
 }  // namespace internal
