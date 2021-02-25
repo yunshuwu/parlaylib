@@ -1,0 +1,13 @@
+name: Build Parlay
+on: push
+
+jobs:
+    check-gcc:
+        runs-on: ubuntu-latest
+        steps:
+        - uses: actions/checkout@v2
+        - run mkdir build
+        - run cd build
+        - run CC=gcc-9 CXX=g++-9 cmake -DCMAKE_BUILD_TYPE=Debug -DPARLAY_TEST=On -DPARLAY_BENCHMARK=On ..
+        - run make
+        - run ctest --no-tests=error --output-on-failure
