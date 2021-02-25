@@ -6,6 +6,7 @@ jobs:
         runs-on: ubuntu-latest
         steps:
         - uses: actions/checkout@v2
+        - run: cd parlaylib
         - run: mkdir build
         - run: cd build
         - run: CC=gcc-9 CXX=g++-9 cmake -DCMAKE_BUILD_TYPE=Debug -DPARLAY_TEST=On -DPARLAY_BENCHMARK=On ..
