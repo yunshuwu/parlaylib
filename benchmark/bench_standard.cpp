@@ -639,6 +639,207 @@ static void bench_group_by_index_256(benchmark::State& state) {
   REPORT_STATS(n, 0, 0);
 }
 
+// Yunshu's benchmarks
+using namespace parlay;
+uint64_t uniform[] = {10,     100,     1000,     5000,      7000,      8000,
+                     10000, 15000, 20000, 50000, 100000, 1000000, 10000000, 100000000, 1000000000};
+uint32_t zipfian[] = {10000, 100000, 1000000, 10000000, 100000000, 1000000000};
+double exp_lambda[] = {1, 0.001, 0.0003, 0.0002, 0.00015, 0.0001, 0.00001};
+
+template<typename K, typename V>
+struct mypair {
+    K first;
+    V second;
+};
+
+void scan_inplace__ (uint32_t* in, uint32_t n) {
+    if (n <= THRESHOLDS) {
+        // cout << "THRESHOLDS: " << THRESHOLDS << endl;
+        for (size_t i = 1;i < n;i++) {
+            in[i] += in[i-1];
+        }
+        return;
+    }
+    uint32_t root_n = (uint32_t)sqrt(n);// split the array into root n blocks
+    uint32_t* offset = new uint32_t[root_n-1];   
+    
+    parallel_for (0, root_n-1, [&] (size_t i) {
+        offset[i] = 0;
+        for (size_t j = i*root_n;j < (i+1)*root_n;j++) {
+            offset[i] += in[j];
+        }
+    });
+
+    for (size_t i = 1;i < root_n-1;i++) offset[i] += offset[i-1];
+
+    // prefix sum for each subarray
+    parallel_for (0, root_n, [&] (size_t i) {
+        if (i == root_n-1) {// the last one
+            for (size_t j = i*root_n+1;j < n;j++) {
+                in[j] += in[j-1];
+            }
+        } else {
+            for (size_t j = i*root_n+1;j < (i+1)*root_n;j++) {
+                in[j] += in[j-1];
+            }
+        }
+    });
+
+    parallel_for (1, root_n, [&] (size_t i) {
+        if (i == root_n-1)  {
+            for (size_t j = i * root_n;j < n;j++){
+                in[j] += offset[i-1];
+            }
+        } else {
+            for (size_t j = i * root_n;j < (i+1)*root_n;j++) {
+                in[j] +=  offset[i-1];
+            }
+        }
+    });
+    delete[] offset;
+}
+
+void uniform_generator_int64_ (mypair<uint64_t, uint64_t>* A, 
+                               int n, uint64_t uniform_max_range) {
+    parallel_for (0, n, [&] (uint32_t i){
+        // in order to put all keys in range [0, uniform_max_range]
+        A[i].first = parlay::hash64_2(i) % uniform_max_range; 
+        if (A[i].first > uniform_max_range) A[i].first -= uniform_max_range;
+        if (A[i].first > uniform_max_range) cout << "wrong..." << endl;
+        A[i].first = parlay::hash64_2(A[i].first);
+        A[i].second = parlay::hash64_2(i);
+    }, 1);
+}
+
+void exponential_generator_int64_ (mypair<uint64_t, uint64_t>* A, 
+                                  int n, int exp_cutoff, double exp_lambda) { 
+    sequence<uint32_t> nums(exp_cutoff);
+    sequence<mypair<uint64_t, uint64_t>> B(n);
+    // double base = 1 - exp(-1);
+    // cout << "1 - e^-1 = " << base << endl;
+    // cout << "e^-2 = " << exp(-2) << endl;
+
+    /* 1. making nums[] array */
+    parallel_for (0, exp_cutoff, [&] (int i) {
+        nums[i] = (double)n * (exp(-exp_lambda * i) * (1 - exp(-exp_lambda)));
+    }, 1);
+
+    uint32_t offset = reduce(nums, addm<uint32_t>());
+    nums[0] += (n - offset);
+    // cout << "offset/n = " << offset << "/" << n << endl;
+    // checking if the sum of nums[] equals to n
+    if (reduce(nums, addm<uint32_t>()) == (uint32_t)n) {
+        cout << "sum of nums[] == n" << endl;
+    }
+
+    /* 2. scan to calculate position */ 
+    uint32_t* addr = new uint32_t[exp_cutoff];
+    parallel_for (0, exp_cutoff, [&] (uint32_t i) {
+        addr[i] = nums[i];
+    }, 1);
+    scan_inplace__(addr, exp_cutoff); // store all addresses into addr[]
+
+    /* 3. distribute random numbers into A[i].first */
+    parallel_for (0, exp_cutoff, [&] (size_t i) {
+        size_t st = (i == 0) ? 0 : addr[i-1],
+               ed = (i == (uint32_t)exp_cutoff-1) ? n : addr[i];
+        for (size_t j = st; j < ed; j++) {
+            B[j].first = parlay::hash64_2(i);
+        }
+    }, 1);
+    parallel_for (0, n, [&] (size_t i){
+        B[i].second = parlay::hash64_2(i);
+    }, 1);
+
+    /* 4. shuffle the keys */
+    sequence<mypair<uint64_t, uint64_t>> C = parlay::random_shuffle(B, n);
+
+    parallel_for (0, n, [&] (size_t i) {
+        A[i] = C[i];
+    });
+
+    delete[] addr;
+}
+
+void zipfian_generator_int64_ (mypair<uint64_t, uint64_t> *A, 
+                               int n, uint32_t zipf_s) {
+    sequence<uint32_t> nums(zipf_s); // in total zipf_s kinds of keys
+    sequence<mypair<uint64_t, uint64_t>> B(n);
+    
+    /* 1. making nums[] array */
+    uint32_t number = (uint32_t) (n / log(n)); // number= n/ln(n)
+    parallel_for (0, zipf_s, [&] (uint32_t i) {
+        nums[i] = (uint32_t) (number / (i+1));
+    }, 1);
+
+    // the last nums[zipf_s-1] should be (n - \sum{zipf_s-1}nums[])
+    uint32_t offset = reduce(nums, addm<uint32_t>()); // cout << "offset = " << offset << endl;
+    // nums[zipf_s-1] += (n - offset);
+    nums[0] += (n - offset);
+
+    // checking if the sum of nums[] equals to n
+    if (reduce(nums, addm<uint32_t>()) == (uint32_t)n) {
+        cout << "sum of nums[] == n" << endl;
+    }
+
+    /* 2. scan to calculate position */ 
+    uint32_t* addr = new uint32_t[zipf_s];
+    parallel_for (0, zipf_s, [&] (uint32_t i) {
+        addr[i] = nums[i];
+    }, 1);
+    scan_inplace__(addr, zipf_s); // store all addresses into addr[]
+    
+    /* 3. distribute random numbers into A[i].first */
+    parallel_for (0, zipf_s, [&] (uint32_t i) {
+        uint32_t st = (i == 0) ? 0 : addr[i-1],
+                 ed = (i == zipf_s-1) ? n : addr[i];
+        for (uint32_t j = st; j < ed; j++) {
+            B[j].first = parlay::hash64_2(i);
+        }
+    }, 1);
+    parallel_for (0, n, [&] (size_t i){
+        B[i].second = parlay::hash64_2(i);
+    }, 1);
+
+    /* 4. shuffle the keys */
+    // random_shuffle(A, A + n);
+    sequence<mypair<uint64_t, uint64_t>> C = parlay::random_shuffle(B, n);
+
+    parallel_for (0, n, [&] (size_t i) {
+        A[i] = C[i];
+    });
+
+    delete[] addr;
+}
+
+template<typename T>
+static void bench_integer_sort_inplace_pair(benchmark::State& state) {
+  size_t n = 1000000000; // n = 1e9
+  size_t idx = state.range(0); // which distribution
+  // using par = std::pair<T,T>;
+  mypair<uint64_t, uint64_t>* A = new mypair<uint64_t, uint64_t>[n];
+  sequence<mypair<uint64_t, uint64_t>> A(n);
+
+  if (idx >= 0 && idx <= 14) {
+    // uniform distributions
+    cout << "uniform[" << idx << "]=" << uniform[idx] << endl;
+    uniform_generator_int64_(A, n, uniform[idx]);
+  }
+
+  parlay::random r(0);
+  size_t bits = sizeof(T)*8;
+  auto S = parlay::tabulate(n, [&] (size_t i) -> par {
+				 return par(r.ith_rand(i),i);});
+  auto first = [] (par a) {return a.first;};
+
+  while (state.KeepRunningBatch(10)) {
+    for (int i = 0; i < 10; i++) {
+      RUN_AND_CLEAR(parlay::internal::integer_sort(parlay::make_slice(S), first, bits));
+    }
+  }
+
+
+
 // ------------------------- Registration -------------------------------
 
 #define BENCH(NAME, T, args...) BENCHMARK_TEMPLATE(bench_ ## NAME, T)               \
@@ -646,45 +847,45 @@ static void bench_group_by_index_256(benchmark::State& state) {
                           ->Unit(benchmark::kMillisecond)                           \
                           ->Args({args});
 
-BENCH(map, long, 100000000);
-BENCH(tabulate, long, 100000000);
-BENCH(reduce_add, long, 100000000);
-BENCH(scan_add, long, 100000000);
-BENCH(pack, long, 100000000);
-BENCH(gather, long, 100000000);
-BENCH(scatter, long, 100000000);
-BENCH(scatter, int, 100000000);
-BENCH(write_add, long, 100000000);
-BENCH(write_min, long, 100000000);
-BENCH(count_sort, long, 100000000, 4);
-BENCH(count_sort, long, 100000000, 8);
-BENCH(integer_sort, unsigned int, 100000000);
-BENCH(integer_sort_pair, unsigned int, 100000000);
-BENCH(integer_sort_128, __int128, 100000000);
-BENCH(sort, unsigned int, 100000000);
-BENCH(sort, long, 100000000);
-BENCH(sort, __int128, 100000000);
-BENCH(sort, parlay::sequence<char>, 100000000);
-BENCH(sort_inplace, unsigned int, 100000000);
-BENCH(sort_inplace, long, 100000000);
-BENCH(sort_inplace, __int128, 100000000);
-BENCH(merge, long, 100000000);
-BENCH(merge_sort, long, 100000000);
-BENCH(quicksort, long, 100000000);
-BENCH(random_shuffle, long, 100000000);
-BENCH(histogram, unsigned int, 100000000);
-BENCH(histogram_same, unsigned int, 100000000);
-BENCH(histogram_few, unsigned int, 100000000);
-BENCH(reduce_by_index_256, unsigned int, 100000000);
-BENCH(reduce_by_index, unsigned int, 100000000);
-BENCH(remove_duplicate_integers, unsigned int, 100000000);
-BENCH(group_by_index_256, unsigned int, 100000000);
-BENCH(group_by_index, unsigned int, 100000000);
-BENCH(reduce_by_key, unsigned long, 100000000);
-BENCH(histogram_by_key, unsigned long, 100000000);
-BENCH(remove_duplicates, unsigned long, 100000000);
-BENCH(group_by_key, unsigned long, 100000000);
-BENCH(group_by_key_sorted, unsigned long, 100000000);
-BENCH(histogram_by_key, parlay::sequence<char>, 100000000);
-BENCH(remove_duplicates, parlay::sequence<char>, 100000000);
-BENCH(group_by_key, parlay::sequence<char>, 100000000);
+BENCH(map, long, 1000000000);
+BENCH(tabulate, long, 1000000000);
+BENCH(reduce_add, long, 1000000000);
+BENCH(scan_add, long, 1000000000);
+BENCH(pack, long, 1000000000);
+BENCH(gather, long, 1000000000);
+BENCH(scatter, long, 1000000000);
+BENCH(scatter, int, 1000000000);
+BENCH(write_add, long, 1000000000);
+BENCH(write_min, long, 1000000000);
+BENCH(count_sort, long, 1000000000, 4);
+BENCH(count_sort, long, 1000000000, 8);
+BENCH(integer_sort, unsigned int, 1000000000);
+BENCH(integer_sort_pair, unsigned int, 1000000000);
+BENCH(integer_sort_128, __int128, 1000000000);
+BENCH(sort, unsigned int, 1000000000);
+BENCH(sort, long, 1000000000);
+BENCH(sort, __int128, 1000000000);
+BENCH(sort, parlay::sequence<char>, 1000000000);
+BENCH(sort_inplace, unsigned int, 1000000000);
+BENCH(sort_inplace, long, 1000000000);
+BENCH(sort_inplace, __int128, 1000000000);
+BENCH(merge, long, 1000000000);
+BENCH(merge_sort, long, 1000000000);
+BENCH(quicksort, long, 1000000000);
+BENCH(random_shuffle, long, 1000000000);
+BENCH(histogram, unsigned int, 1000000000);
+BENCH(histogram_same, unsigned int, 1000000000);
+BENCH(histogram_few, unsigned int, 1000000000);
+BENCH(reduce_by_index_256, unsigned int, 1000000000);
+BENCH(reduce_by_index, unsigned int, 1000000000);
+BENCH(remove_duplicate_integers, unsigned int, 1000000000);
+BENCH(group_by_index_256, unsigned int, 1000000000);
+BENCH(group_by_index, unsigned int, 1000000000);
+BENCH(reduce_by_key, unsigned long, 1000000000);
+BENCH(histogram_by_key, unsigned long, 1000000000);
+BENCH(remove_duplicates, unsigned long, 1000000000);
+BENCH(group_by_key, unsigned long, 1000000000);
+BENCH(group_by_key_sorted, unsigned long, 1000000000);
+BENCH(histogram_by_key, parlay::sequence<char>, 1000000000);
+BENCH(remove_duplicates, parlay::sequence<char>, 1000000000);
+BENCH(group_by_key, parlay::sequence<char>, 1000000000);
